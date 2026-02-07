@@ -16,8 +16,8 @@ export const { use: useKeybind, provider: KeybindProvider } = createSimpleContex
     const config = useTuiConfig()
     const keybinds = createMemo<Record<string, Keybind.Info[]>>(() => {
       return pipe(
-        (config.keybinds ?? {}) as Record<string, string>,
-        mapValues((value) => Keybind.parse(value)),
+        config.keybinds ?? {},
+        mapValues((value) => (typeof value === "string" ? Keybind.parse(value) : [])),
       )
     })
     const [store, setStore] = createStore({

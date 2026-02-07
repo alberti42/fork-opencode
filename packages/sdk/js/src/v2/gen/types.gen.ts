@@ -3738,6 +3738,8 @@ export type SessionMessagesData = {
      */
     limit?: number
     before?: string
+    after?: string
+    oldest?: string
   }
   url: "/session/{sessionID}/message"
 }

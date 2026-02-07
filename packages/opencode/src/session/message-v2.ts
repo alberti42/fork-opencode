@@ -6,7 +6,7 @@ import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessag
 import { LSP } from "../lsp"
 import { Snapshot } from "@/snapshot"
 import { SyncEvent } from "../sync"
-import { Database, NotFoundError, and, desc, eq, inArray, lt, or } from "@/storage"
+import { Database, NotFoundError, and, asc, desc, eq, gt, inArray, lt, or } from "@/storage"
 import { MessageTable, PartTable, SessionTable } from "./session.sql"
 import { ProviderError } from "@/provider"
 import { iife } from "@/util/iife"
@@ -544,6 +544,9 @@ const part = (row: typeof PartTable.$inferSelect) =>
 const older = (row: Cursor) =>
   or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
 
+const newer = (row: Cursor) =>
+  or(gt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), gt(MessageTable.id, row.id)))
+
 function hydrate(rows: (typeof MessageTable.$inferSelect)[]) {
   const ids = rows.map((row) => row.id)
   const partByMessage = new Map<string, Part[]>()
@@ -839,17 +842,39 @@ export function toModelMessages(
   return Effect.runPromise(toModelMessagesEffect(input, model, options).pipe(Effect.provide(EffectLogger.layer)))
 }
 
-export function page(input: { sessionID: SessionID; limit: number; before?: string }) {
+export function page(input: {
+  sessionID: SessionID
+  limit: number
+  before?: string
+  after?: string
+  oldest?: boolean
+}) {
+  if (input.before && input.after) {
+    throw new Error("Cannot specify both 'before' and 'after' cursors")
+  }
+  if (input.oldest && (input.before || input.after)) {
+    throw new Error("Cannot use 'oldest' with 'before' or 'after' cursors")
+  }
+
   const before = input.before ? cursor.decode(input.before) : undefined
-  const where = before
-    ? and(eq(MessageTable.session_id, input.sessionID), older(before))
-    : eq(MessageTable.session_id, input.sessionID)
+  const after = input.after ? cursor.decode(input.after) : undefined
+  const where = input.oldest
+    ? eq(MessageTable.session_id, input.sessionID)
+    : after
+      ? and(eq(MessageTable.session_id, input.sessionID), newer(after))
+      : before
+        ? and(eq(MessageTable.session_id, input.sessionID), older(before))
+        : eq(MessageTable.session_id, input.sessionID)
+  const order =
+    input.oldest || after
+      ? [asc(MessageTable.time_created), asc(MessageTable.id)]
+      : [desc(MessageTable.time_created), desc(MessageTable.id)]
   const rows = Database.use((db) =>
     db
       .select()
       .from(MessageTable)
       .where(where)
-      .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+      .orderBy(...order)
       .limit(input.limit + 1)
       .all(),
   )
@@ -860,19 +885,42 @@ export function page(input: { sessionID: SessionID; limit: number; before?: stri
     if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
     return {
       items: [] as WithParts[],
-      more: false,
+      before: undefined,
+      after: undefined,
     }
   }
 
   const more = rows.length > input.limit
   const slice = more ? rows.slice(0, input.limit) : rows
   const items = hydrate(slice)
-  items.reverse()
-  const tail = slice.at(-1)
+  if (!input.oldest && !after) items.reverse()
+  const first = slice.at(0)
+  const last = slice.at(-1)
+  const encode = (row: typeof MessageTable.$inferSelect) => cursor.encode({ id: row.id, time: row.time_created })
   return {
     items,
-    more,
-    cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
+    before: input.oldest
+      ? undefined
+      : after
+        ? first
+          ? encode(first)
+          : undefined
+        : more && last
+          ? encode(last)
+          : undefined,
+    after: input.oldest
+      ? more && last
+        ? encode(last)
+        : undefined
+      : after
+        ? more && last
+          ? encode(last)
+          : undefined
+        : before
+          ? first
+            ? encode(first)
+            : undefined
+          : undefined,
   }
 }
 
@@ -885,8 +933,8 @@ export function* stream(sessionID: SessionID) {
     for (let i = next.items.length - 1; i >= 0; i--) {
       yield next.items[i]
     }
-    if (!next.more || !next.cursor) break
-    before = next.cursor
+    if (!next.before) break
+    before = next.before
   }
 }
 

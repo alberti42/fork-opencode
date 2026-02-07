@@ -3,6 +3,7 @@ import { createStore, produce, reconcile } from "solid-js/store"
 import { Binary } from "@opencode-ai/shared/util/binary"
 import { retry } from "@opencode-ai/shared/util/retry"
 import { createSimpleContext } from "@opencode-ai/ui/context"
+import { hasVisibleUserBeforeRevert, loadRevertAwareLatestPage } from "./revert-page"
 import {
   clearSessionPrefetch,
   getSessionPrefetch,
@@ -16,6 +17,17 @@ import { SESSION_CACHE_LIMIT, dropSessionCaches, pickSessionCacheEvictions } fro
 import { diffs as list, message as clean } from "@/utils/diffs"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
+
+function nextBefore(link: string | null) {
+  if (!link) return undefined
+  const match = /<([^>]+)>;\s*rel="prev"/.exec(link)
+  if (!match) return undefined
+  try {
+    return new URL(match[1]).searchParams.get("before") ?? undefined
+  } catch {
+    return undefined
+  }
+}
 
 function sortParts(parts: Part[]) {
   return parts.filter((part) => !!part?.id).sort((a, b) => cmp(a.id, b.id))
@@ -296,20 +308,39 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       sessionID: string
       limit: number
       before?: string
+      revertMessageID?: string
     }) => {
+      const toPage = (messages: Awaited<ReturnType<typeof input.client.session.messages>>) => {
+        const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
+        const session = items.map((x) => clean(x.info)).sort((a, b) => cmp(a.id, b.id))
+        const part = items.map((message) => ({ id: message.info.id, part: sortParts(message.parts) }))
+        const cursor = nextBefore(messages.response.headers.get("Link"))
+        return {
+          session,
+          part,
+          cursor,
+          complete: !cursor,
+        }
+      }
+
       const messages = await retry(() =>
         input.client.session.messages({ sessionID: input.sessionID, limit: input.limit, before: input.before }),
       )
-      const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
-      const session = items.map((x) => clean(x.info)).sort((a, b) => cmp(a.id, b.id))
-      const part = items.map((message) => ({ id: message.info.id, part: sortParts(message.parts) }))
-      const cursor = messages.response.headers.get("x-next-cursor") ?? undefined
-      return {
-        session,
-        part,
-        cursor,
-        complete: !cursor,
-      }
+      const page = toPage(messages)
+      if (input.before) return page
+      return loadRevertAwareLatestPage({
+        current: page,
+        revertMessageID: input.revertMessageID,
+        fetchMessage: (messageID) =>
+          retry(() => input.client.session.message({ sessionID: input.sessionID, messageID })).then((result) => {
+            if (!result.data?.info?.id) return undefined
+            return { info: clean(result.data.info), parts: sortParts(result.data.parts) }
+          }),
+        fetchPage: (before) =>
+          retry(() => input.client.session.messages({ sessionID: input.sessionID, limit: input.limit, before })).then(
+            toPage,
+          ),
+      })
     }
 
     const tracked = (directory: string, sessionID: string) => seen.get(directory)?.has(sessionID) ?? false
@@ -321,6 +352,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       sessionID: string
       limit: number
       before?: string
+      revertMessageID?: string
       mode?: "replace" | "prepend"
     }) => {
       const key = keyFor(input.directory, input.sessionID)
@@ -460,18 +492,24 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
               }
             }
 
-            const hasSession = Binary.search(store.session, sessionID, (s) => s.id).found
+            const sessionMatch = Binary.search(store.session, sessionID, (s) => s.id)
+            const sessionInfo = sessionMatch.found ? store.session[sessionMatch.index] : undefined
             const cached = store.message[sessionID] !== undefined && meta.limit[key] !== undefined
-            if (cached && hasSession && !opts?.force) return
+            const canReuseCached = !!(
+              cached &&
+              sessionInfo &&
+              hasVisibleUserBeforeRevert(store.message[sessionID] ?? [], sessionInfo.revert?.messageID)
+            )
+            if (canReuseCached && !opts?.force) return
 
             const limit = meta.limit[key] ?? initialMessagePageSize
-            const sessionReq =
-              hasSession && !opts?.force
-                ? Promise.resolve()
-                : retry(() => client.session.get({ sessionID })).then((session) => {
-                    if (!tracked(directory, sessionID)) return
+            const nextSession =
+              sessionInfo && !opts?.force
+                ? sessionInfo
+                : await retry(() => client.session.get({ sessionID })).then((session) => {
+                    if (!tracked(directory, sessionID)) return undefined
                     const data = session.data
-                    if (!data) return
+                    if (!data) return undefined
                     setStore(
                       "session",
                       produce((draft) => {
@@ -483,10 +521,11 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                         draft.splice(match.index, 0, data)
                       }),
                     )
+                    return data
                   })
 
             const messagesReq =
-              cached && !opts?.force
+              canReuseCached && !opts?.force
                 ? Promise.resolve()
                 : loadMessages({
                     directory,
@@ -494,9 +533,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                     setStore,
                     sessionID,
                     limit,
+                    revertMessageID: nextSession?.revert?.messageID,
                   })
 
-            await Promise.all([sessionReq, messagesReq])
+            await messagesReq
           })
         },
         async diff(sessionID: string, opts?: { force?: boolean }) {

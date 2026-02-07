@@ -677,6 +677,17 @@ export default function Layout(props: ParentProps) {
     running: number
   }
 
+  function nextBefore(link: string | null) {
+    if (!link) return undefined
+    const match = /<([^>]+)>;\s*rel="prev"/.exec(link)
+    if (!match) return undefined
+    try {
+      return new URL(match[1]).searchParams.get("before") ?? undefined
+    } catch {
+      return undefined
+    }
+  }
+
   const prefetchChunk = 200
   const prefetchConcurrency = 2
   const prefetchPendingLimit = 10
@@ -777,7 +788,7 @@ export default function Layout(props: ParentProps) {
             const next = items.map((x) => x.info).filter((m): m is Message => !!m?.id)
             const sorted = mergeByID([], next)
             const stale = markPrefetched(directory, sessionID)
-            const cursor = messages.response.headers.get("x-next-cursor") ?? undefined
+            const cursor = nextBefore(messages.response.headers.get("Link"))
             const meta = {
               limit: sorted.length,
               cursor,

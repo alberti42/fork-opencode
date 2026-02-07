@@ -41,6 +41,7 @@ import { useSDK } from "@/context/sdk"
 import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
+import { hasVisibleUserBeforeRevert } from "@/context/revert-page"
 import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
 import { createSessionComposerState, SessionComposerRegion } from "@/pages/session/composer"
 import {
@@ -506,6 +507,23 @@ export default function Page() {
         if (!prev) return
         if (next.dir === prev.dir && next.id === prev.id) return
         if (prev.id && !next.id) local.session.reset()
+      },
+      { defer: true },
+    ),
+  )
+
+  createEffect(
+    on(
+      () => [params.id, revertMessageID()] as const,
+      ([id, revert], prev) => {
+        if (!id) return
+        if (prev && prev[0] === id && prev[1] === revert) return
+        if (!revert) {
+          if (prev?.[1]) void sync.session.sync(id, { force: true })
+          return
+        }
+        if (hasVisibleUserBeforeRevert(messages(), revert)) return
+        void sync.session.sync(id, { force: true })
       },
       { defer: true },
     ),
