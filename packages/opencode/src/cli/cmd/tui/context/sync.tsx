@@ -29,7 +29,7 @@ import { batch, onMount } from "solid-js"
 import { Log } from "@/util/log"
 import type { Path } from "@opencode-ai/sdk"
 import { parseLinkHeader } from "@/util/link-header"
-import { evictFromEnd, evictFromStart, windowNewest, windowOldest } from "@tui/util/pagination"
+import { evictFromEnd, evictFromStart, paginationError, windowNewest, windowOldest } from "@tui/util/pagination"
 
 /** Maximum messages kept in memory per session */
 const MAX_LOADED_MESSAGES = 500
@@ -466,7 +466,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         })
         .catch(async (e) => {
           Log.Default.error("tui bootstrap failed", {
-            error: e instanceof Error ? e.message : String(e),
+            error: paginationError(e),
             name: e instanceof Error ? e.name : undefined,
             stack: e instanceof Error ? e.stack : undefined,
           })
@@ -625,7 +625,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
               loading: false,
               oldest: page?.oldest,
               newest: page?.newest,
-              error: e instanceof Error ? e.message : String(e),
+              error: paginationError(e),
             })
           } finally {
             loadingGuard.delete(sessionID)
@@ -694,7 +694,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
               loading: false,
               oldest: page?.oldest,
               newest: page?.newest,
-              error: e instanceof Error ? e.message : String(e),
+              error: paginationError(e),
             })
           } finally {
             loadingGuard.delete(sessionID)
@@ -782,7 +782,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                 const p = draft.message_page[sessionID]
                 if (p) {
                   p.loading = false
-                  p.error = e instanceof Error ? e.message : String(e)
+                  p.error = paginationError(e)
                 }
               }),
             )
@@ -809,11 +809,33 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
               { throwOnError: true },
             )
 
-            const messages = res.data ?? []
+            const session = store.session.find((s) => s.id === sessionID)
+            const revertMessageID = session?.revert?.messageID
+
+            let messages = res.data ?? []
             const pageOldest = messages.at(0)?.info.id
             const pageNewest = messages.at(-1)?.info.id
             const link = res.response.headers.get("link") ?? ""
             const hasNewer = parseLinkHeader(link).next !== undefined
+
+            if (revertMessageID && !messages.some((m) => m.info.id === revertMessageID)) {
+              try {
+                const revertResult = await sdk.client.session.message(
+                  { sessionID, messageID: revertMessageID },
+                  { throwOnError: true },
+                )
+                if (revertResult.data) {
+                  const index = Binary.search(messages, revertResult.data.info.id, (m) => m.info.id)
+                  if (!index.found) messages.splice(index.index, 0, revertResult.data)
+                }
+              } catch (e) {
+                Log.Default.info("Revert marker fetch failed during jumpToOldest", {
+                  messageID: revertMessageID,
+                  error: e,
+                })
+              }
+            }
+
             const nextOldest = pageOldest ?? messages.at(0)?.info.id
             const nextNewest = pageNewest ?? messages.at(-1)?.info.id
 
@@ -849,7 +871,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                 const p = draft.message_page[sessionID]
                 if (p) {
                   p.loading = false
-                  p.error = e instanceof Error ? e.message : String(e)
+                  p.error = paginationError(e)
                 }
               }),
             )
