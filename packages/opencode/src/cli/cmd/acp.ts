@@ -1,5 +1,7 @@
 import * as Log from "@opencode-ai/core/util/log"
 import { Effect } from "effect"
+import path from "node:path"
+import type { Argv } from "yargs"
 import { effectCmd } from "../effect-cmd"
 import { AgentSideConnection, ndJsonStream } from "@agentclientprotocol/sdk"
 import { ACP } from "@/acp/agent"
@@ -13,22 +15,51 @@ const log = Log.create({ service: "acp-command" })
 export const AcpCommand = effectCmd({
   command: "acp",
   describe: "start ACP (Agent Client Protocol) server",
-  builder: (yargs) => {
-    return withNetworkOptions(yargs).option("cwd", {
-      describe: "working directory",
-      type: "string",
-      default: process.cwd(),
-    })
+  // ACP handlers read the local InstanceContext via Instance.current (ALS) —
+  // e.g. AgentModule.Service.defaultAgent() in resolveModeState. So we always
+  // load a local instance, even when --attach is set; the SDK still proxies
+  // workspace-scoped calls to the remote server.
+  directory: (args) => (args.cwd ? path.resolve(process.cwd(), args.cwd) : process.cwd()),
+  builder: (yargs: Argv) => {
+    return withNetworkOptions(yargs)
+      .option("attach", {
+        type: "string",
+        describe: "attach to a running opencode server (e.g., http://localhost:4096)",
+      })
+      .option("password", {
+        alias: ["p"],
+        type: "string",
+        describe: "basic auth password (defaults to OPENCODE_SERVER_PASSWORD)",
+      })
+      .option("username", {
+        alias: ["u"],
+        type: "string",
+        describe: "basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')",
+      })
+      .option("cwd", {
+        describe: "working directory, path on remote server if attaching",
+        type: "string",
+      })
   },
   handler: Effect.fn("Cli.acp")(function* (args) {
     process.env.OPENCODE_CLIENT = "acp"
-    const opts = yield* resolveNetworkOptions(args)
-    const server = yield* Effect.promise(() => Server.listen(opts))
 
-    const sdk = createOpencodeClient({
-      baseUrl: `http://${server.hostname}:${server.port}`,
-      headers: ServerAuth.headers(),
-    })
+    let sdk: ReturnType<typeof createOpencodeClient>
+    if (args.attach) {
+      sdk = createOpencodeClient({
+        baseUrl: args.attach,
+        directory: args.cwd,
+        headers: ServerAuth.headers({ password: args.password, username: args.username }),
+      })
+    } else {
+      const opts = yield* resolveNetworkOptions(args)
+      const server = yield* Effect.promise(() => Server.listen(opts))
+      sdk = createOpencodeClient({
+        baseUrl: `http://${server.hostname}:${server.port}`,
+        directory: args.cwd,
+        headers: ServerAuth.headers(),
+      })
+    }
 
     const input = new WritableStream<Uint8Array>({
       write(chunk) {

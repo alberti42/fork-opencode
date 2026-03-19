@@ -488,13 +488,26 @@ opencode acp
 
 Bu komut, nd-JSON kullanarak stdin/stdout aracılığıyla iletişim kuran bir ACP sunucusunu başlatır.
 
+Yerel bir arka uç başlatmak yerine ACP stdio'yu mevcut bir sunucuya köprülemek için çalışan bir `opencode serve` örneğine de bağlanabilirsiniz:
+
+```bash
+# Start a headless server in one terminal
+opencode serve
+
+# In another terminal, bridge ACP stdio to it
+opencode acp --attach http://localhost:4096
+```
+
+Bağlanırken `--cwd` yine geçerlidir, ancak yol bağlı sunucuda yorumlanır.
+
 #### Bayraklar
 
-| Bayrak                                   | Açıklama            |
-| ---------------------------------------- | ------------------- |
-| <nobr><code>{"--cwd"}</code></nobr>      | Çalışma dizini      |
-| <nobr><code>{"--port"}</code></nobr>     | Dinlenecek port     |
-| <nobr><code>{"--hostname"}</code></nobr> | Dinlenecek host adı |
+| Bayrak                                   | Açıklama                                                                |
+| ---------------------------------------- | ----------------------------------------------------------------------- |
+| <nobr><code>{"--cwd"}</code></nobr>      | Çalışma dizini                                                          |
+| <nobr><code>{"--attach"}</code></nobr>   | Çalışan bir opencode sunucusuna bağlanın (ör. http://localhost:4096)    |
+| <nobr><code>{"--port"}</code></nobr>     | Dinlenecek port                                                         |
+| <nobr><code>{"--hostname"}</code></nobr> | Dinlenecek host adı                                                     |
 
 ---
 
