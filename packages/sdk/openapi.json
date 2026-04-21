@@ -3377,6 +3377,20 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "oldest",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "summary": "Get session messages",
@@ -3384,6 +3398,14 @@
         "responses": {
           "200": {
             "description": "List of messages",
+            "headers": {
+              "Link": {
+                "description": "RFC 8288 pagination links for previous/next message pages",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {

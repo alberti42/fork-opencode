@@ -609,6 +609,14 @@ export const SessionRoutes = lazy(() =>
         responses: {
           200: {
             description: "List of messages",
+            headers: {
+              Link: {
+                description: "RFC 8288 pagination links for previous/next message pages",
+                schema: {
+                  type: "string",
+                },
+              },
+            },
             content: {
               "application/json": {
                 schema: resolver(MessageV2.WithParts.array()),
@@ -626,40 +634,63 @@ export const SessionRoutes = lazy(() =>
       ),
       validator(
         "query",
-        z
-          .object({
-            limit: z.coerce
-              .number()
-              .int()
-              .min(0)
-              .optional()
-              .meta({ description: "Maximum number of messages to return" }),
-            before: z
-              .string()
-              .optional()
-              .meta({ description: "Opaque cursor for loading older messages" })
-              .refine(
-                (value) => {
-                  if (!value) return true
-                  try {
-                    MessageV2.cursor.decode(value)
-                    return true
-                  } catch {
-                    return false
-                  }
-                },
-                { message: "Invalid cursor" },
-              ),
-          })
-          .refine((value) => !value.before || value.limit !== undefined, {
-            message: "before requires limit",
-            path: ["before"],
-          }),
+        z.object({
+          limit: z.coerce
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .meta({ description: "Maximum number of messages to return" }),
+          before: z
+            .string()
+            .optional()
+            .meta({ description: "Opaque cursor for loading older messages" })
+            .refine(
+              (value) => {
+                if (!value) return true
+                try {
+                  MessageV2.cursor.decode(value)
+                  return true
+                } catch {
+                  return false
+                }
+              },
+              { message: "Invalid cursor" },
+            ),
+          after: z
+            .string()
+            .optional()
+            .meta({ description: "Opaque cursor for loading newer messages" })
+            .refine(
+              (value) => {
+                if (!value) return true
+                try {
+                  MessageV2.cursor.decode(value)
+                  return true
+                } catch {
+                  return false
+                }
+              },
+              { message: "Invalid cursor" },
+            ),
+          oldest: z.stringbool().optional(),
+        }),
       ),
       async (c) => {
         const query = c.req.valid("query")
         const sessionID = c.req.valid("param").sessionID
-        if (query.limit === undefined || query.limit === 0) {
+        if (query.before && query.after) {
+          return c.json({ error: "Cannot specify both 'before' and 'after'" }, 400)
+        }
+        if (query.oldest && (query.before || query.after)) {
+          return c.json({ error: "Cannot use 'oldest' with 'before' or 'after'" }, 400)
+        }
+        if (
+          query.before === undefined &&
+          query.after === undefined &&
+          query.oldest === undefined &&
+          query.limit === undefined
+        ) {
           const messages = await runRequest(
             "SessionRoutes.messages",
             c,
@@ -671,20 +702,49 @@ export const SessionRoutes = lazy(() =>
           )
           return c.json(messages)
         }
+        if (query.limit === 0) {
+          await runRequest(
+            "SessionRoutes.messages",
+            c,
+            Effect.gen(function* () {
+              const session = yield* Session.Service
+              yield* session.get(sessionID)
+            }),
+          )
+          return c.json([])
+        }
 
+        const pageLimit = query.limit ?? 100
         const page = await MessageV2.page({
           sessionID,
-          limit: query.limit,
+          limit: pageLimit,
           before: query.before,
+          after: query.after,
+          oldest: query.oldest,
         })
-        if (page.cursor) {
-          const url = new URL(c.req.url)
-          url.searchParams.set("limit", query.limit.toString())
-          url.searchParams.set("before", page.cursor)
-          c.header("Access-Control-Expose-Headers", "Link, X-Next-Cursor")
-          c.header("Link", `<${url.toString()}>; rel="next"`)
-          c.header("X-Next-Cursor", page.cursor)
+
+        const links: string[] = []
+        if (page.before) {
+          const prev = new URL(c.req.url)
+          prev.searchParams.delete("after")
+          prev.searchParams.delete("oldest")
+          prev.searchParams.set("limit", pageLimit.toString())
+          prev.searchParams.set("before", page.before)
+          links.push(`<${prev.toString()}>; rel="prev"`)
         }
+        if (page.after) {
+          const next = new URL(c.req.url)
+          next.searchParams.delete("before")
+          next.searchParams.delete("oldest")
+          next.searchParams.set("limit", pageLimit.toString())
+          next.searchParams.set("after", page.after)
+          links.push(`<${next.toString()}>; rel="next"`)
+        }
+        if (links.length > 0) {
+          c.header("Access-Control-Expose-Headers", "Link")
+          c.header("Link", links.join(", "))
+        }
+
         return c.json(page.items)
       },
     )
