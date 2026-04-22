@@ -144,6 +144,16 @@ const live: Layer.Layer<
         options.instructions = system.join("\n")
       }
 
+      Bun.write(
+        "/tmp/opencode-prompt-debug.txt",
+        [
+          `=== system (${system.length} parts) ===`,
+          system.join("\n---\n"),
+          `=== options.instructions ===`,
+          options.instructions ?? "(not set)",
+        ].join("\n\n"),
+      )
+
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
       const messages = isOpenaiOauth
         ? input.messages
