@@ -41,6 +41,8 @@ export const MessagesQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   limit: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
   before: Schema.optional(Schema.String),
+  after: Schema.optional(Schema.String),
+  oldest: Schema.optional(QueryBoolean),
 })
 export const StatusMap = Schema.Record(Schema.String, SessionStatus.Info)
 export const UpdatePayload = Schema.Struct({
@@ -360,6 +362,18 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.shell",
             summary: "Run shell command",
             description: "Execute a shell command within the session context and return the AI's response.",
+          }),
+        ),
+        HttpApiEndpoint.get("revertPreview", SessionPaths.revert, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          success: described(Schema.NullOr(SessionRevert.Preview), "Revert preview"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.revertPreview",
+            summary: "Get revert preview",
+            description: "Return the reverted user messages and next restore boundary for a reverted session.",
           }),
         ),
         HttpApiEndpoint.post("revert", SessionPaths.revert, {

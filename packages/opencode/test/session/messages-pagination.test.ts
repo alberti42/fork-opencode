@@ -146,18 +146,18 @@ describe("MessageV2.page", () => {
         const a = yield* MessageV2.page({ sessionID, limit: 2 })
         expect(a.items.map((item) => item.info.id)).toEqual(ids.slice(-2))
         expect(a.items.every((item) => item.parts.length === 1)).toBe(true)
-        expect(a.more).toBe(true)
-        expect(a.cursor).toBeTruthy()
+        expect(a.before).toBeTruthy()
+        expect(a.after).toBeUndefined()
 
-        const b = yield* MessageV2.page({ sessionID, limit: 2, before: a.cursor! })
+        const b = yield* MessageV2.page({ sessionID, limit: 2, before: a.before! })
         expect(b.items.map((item) => item.info.id)).toEqual(ids.slice(-4, -2))
-        expect(b.more).toBe(true)
-        expect(b.cursor).toBeTruthy()
+        expect(b.before).toBeTruthy()
+        expect(b.after).toBeTruthy()
 
-        const c = yield* MessageV2.page({ sessionID, limit: 2, before: b.cursor! })
+        const c = yield* MessageV2.page({ sessionID, limit: 2, before: b.before! })
         expect(c.items.map((item) => item.info.id)).toEqual(ids.slice(0, 2))
-        expect(c.more).toBe(false)
-        expect(c.cursor).toBeUndefined()
+        expect(c.before).toBeUndefined()
+        expect(c.after).toBeTruthy()
       }),
     ),
   )
@@ -178,8 +178,18 @@ describe("MessageV2.page", () => {
       Effect.gen(function* () {
         const result = yield* MessageV2.page({ sessionID, limit: 10 })
         expect(result.items).toEqual([])
-        expect(result.more).toBe(false)
-        expect(result.cursor).toBeUndefined()
+        expect(result.before).toBeUndefined()
+        expect(result.after).toBeUndefined()
+      }),
+    ),
+  )
+
+  it.instance("session messages honors limit zero", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 2)
+
+        expect(yield* session.messages({ sessionID, limit: 0 })).toEqual([])
       }),
     ),
   )
@@ -200,8 +210,8 @@ describe("MessageV2.page", () => {
 
         const result = yield* MessageV2.page({ sessionID, limit: 3 })
         expect(result.items.map((item) => item.info.id)).toEqual(ids)
-        expect(result.more).toBe(false)
-        expect(result.cursor).toBeUndefined()
+        expect(result.before).toBeUndefined()
+        expect(result.after).toBeUndefined()
       }),
     ),
   )
@@ -214,7 +224,7 @@ describe("MessageV2.page", () => {
         const result = yield* MessageV2.page({ sessionID, limit: 1 })
         expect(result.items).toHaveLength(1)
         expect(result.items[0].info.id).toBe(ids[ids.length - 1])
-        expect(result.more).toBe(true)
+        expect(result.before).toBeTruthy()
       }),
     ),
   )
@@ -245,7 +255,7 @@ describe("MessageV2.page", () => {
         const ids = yield* fill(sessionID, 4, (i: number) => 1000.5 + i)
 
         const a = yield* MessageV2.page({ sessionID, limit: 2 })
-        const b = yield* MessageV2.page({ sessionID, limit: 2, before: a.cursor! })
+        const b = yield* MessageV2.page({ sessionID, limit: 2, before: a.before! })
 
         expect(a.items.map((item) => item.info.id)).toEqual(ids.slice(-2))
         expect(b.items.map((item) => item.info.id)).toEqual(ids.slice(0, 2))
@@ -260,11 +270,11 @@ describe("MessageV2.page", () => {
 
         const a = yield* MessageV2.page({ sessionID, limit: 2 })
         expect(a.items.map((item) => item.info.id)).toEqual(ids.slice(-2))
-        expect(a.more).toBe(true)
+        expect(a.before).toBeTruthy()
 
-        const b = yield* MessageV2.page({ sessionID, limit: 2, before: a.cursor! })
+        const b = yield* MessageV2.page({ sessionID, limit: 2, before: a.before! })
         expect(b.items.map((item) => item.info.id)).toEqual(ids.slice(0, 2))
-        expect(b.more).toBe(false)
+        expect(b.before).toBeUndefined()
       }),
     ),
   )
@@ -297,8 +307,47 @@ describe("MessageV2.page", () => {
         const result = yield* MessageV2.page({ sessionID, limit: 100 })
         expect(result.items).toHaveLength(10)
         expect(result.items.map((item) => item.info.id)).toEqual(ids)
-        expect(result.more).toBe(false)
-        expect(result.cursor).toBeUndefined()
+        expect(result.before).toBeUndefined()
+        expect(result.after).toBeUndefined()
+      }),
+    ),
+  )
+
+  it.instance("pages forward with after cursors and oldest jump", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const ids = yield* fill(sessionID, 6)
+
+        const oldest = yield* MessageV2.page({ sessionID, limit: 2, oldest: true })
+        expect(oldest.items.map((item) => item.info.id)).toEqual(ids.slice(0, 2))
+        expect(oldest.before).toBeUndefined()
+        expect(oldest.after).toBeTruthy()
+
+        const middle = yield* MessageV2.page({ sessionID, limit: 2, after: oldest.after! })
+        expect(middle.items.map((item) => item.info.id)).toEqual(ids.slice(2, 4))
+        expect(middle.before).toBeTruthy()
+        expect(middle.after).toBeTruthy()
+
+        const latest = yield* MessageV2.page({ sessionID, limit: 2, after: middle.after! })
+        expect(latest.items.map((item) => item.info.id)).toEqual(ids.slice(4, 6))
+        expect(latest.before).toBeTruthy()
+        expect(latest.after).toBeUndefined()
+      }),
+    ),
+  )
+
+  it.instance("rejects incompatible cursor combinations", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 2)
+
+        const seed = yield* MessageV2.page({ sessionID, limit: 1 })
+        expect(() =>
+          Effect.runSync(MessageV2.page({ sessionID, limit: 1, before: seed.before!, after: seed.before! })),
+        ).toThrow()
+        expect(() =>
+          Effect.runSync(MessageV2.page({ sessionID, limit: 1, oldest: true, before: seed.before! })),
+        ).toThrow()
       }),
     ),
   )
@@ -1028,14 +1077,14 @@ describe("MessageV2 consistency", () => {
         const streamed = Array.from(MessageV2.stream(sessionID))
 
         const paged = [] as MessageV2.WithParts[]
-        let cursor: string | undefined
+        let before: string | undefined
         while (true) {
-          const result = yield* MessageV2.page({ sessionID, limit: 3, before: cursor })
+          const result = yield* MessageV2.page({ sessionID, limit: 3, before })
           for (let i = result.items.length - 1; i >= 0; i--) {
             paged.push(result.items[i])
           }
-          if (!result.more || !result.cursor) break
-          cursor = result.cursor
+          if (!result.before) break
+          before = result.before
         }
 
         expect(streamed.map((m) => m.info.id)).toEqual(paged.map((m) => m.info.id))

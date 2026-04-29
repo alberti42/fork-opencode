@@ -20,6 +20,7 @@ import * as Stream from "effect/Stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
+import { stripLinkCredentials } from "@/util/link-header"
 import {
   CommandPayload,
   DiffQuery,
@@ -103,39 +104,57 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       query: typeof MessagesQuery.Type
     }) {
-      if (ctx.query.before && ctx.query.limit === undefined) return yield* new HttpApiError.BadRequest({})
-      if (ctx.query.before) {
-        const before = ctx.query.before
+      const oldest = ctx.query.oldest === true
+      if (ctx.query.before && ctx.query.after) return yield* new HttpApiError.BadRequest({})
+      if (oldest && (ctx.query.before || ctx.query.after)) return yield* new HttpApiError.BadRequest({})
+      for (const cursor of [ctx.query.before, ctx.query.after]) {
+        if (!cursor) continue
         yield* Effect.try({
-          try: () => MessageV2.cursor.decode(before),
+          try: () => MessageV2.cursor.decode(cursor),
           catch: () => new HttpApiError.BadRequest({}),
         })
       }
       yield* requireSession(ctx.params.sessionID)
-      if (ctx.query.limit === undefined || ctx.query.limit === 0) {
+      if (ctx.query.before === undefined && ctx.query.after === undefined && !oldest && ctx.query.limit === undefined) {
         return yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       }
+      if (ctx.query.limit === 0) return []
 
+      const pageLimit = ctx.query.limit ?? 100
       const page = yield* SessionError.mapStorageNotFound(
         MessageV2.page({
           sessionID: ctx.params.sessionID,
-          limit: ctx.query.limit,
+          limit: pageLimit,
           before: ctx.query.before,
+          after: ctx.query.after,
+          oldest,
         }),
       )
-      if (!page.cursor) return page.items
 
       const request = yield* HttpServerRequest.HttpServerRequest
-      // toURL() honors the Host + x-forwarded-proto headers, so the Link
-      // header echoes the real origin instead of a hard-coded localhost.
       const url = Option.getOrElse(HttpServerRequest.toURL(request), () => new URL(request.url, "http://localhost"))
-      url.searchParams.set("limit", ctx.query.limit.toString())
-      url.searchParams.set("before", page.cursor)
+      const links: string[] = []
+      if (page.before) {
+        const prev = stripLinkCredentials(url)
+        prev.searchParams.delete("after")
+        prev.searchParams.delete("oldest")
+        prev.searchParams.set("limit", pageLimit.toString())
+        prev.searchParams.set("before", page.before)
+        links.push(`<${prev.toString()}>; rel="prev"`)
+      }
+      if (page.after) {
+        const next = stripLinkCredentials(url)
+        next.searchParams.delete("before")
+        next.searchParams.delete("oldest")
+        next.searchParams.set("limit", pageLimit.toString())
+        next.searchParams.set("after", page.after)
+        links.push(`<${next.toString()}>; rel="next"`)
+      }
+      if (links.length === 0) return page.items
       return HttpServerResponse.jsonUnsafe(page.items, {
         headers: {
-          "Access-Control-Expose-Headers": "Link, X-Next-Cursor",
-          Link: `<${url.toString()}>; rel="next"`,
-          "X-Next-Cursor": page.cursor,
+          "Access-Control-Expose-Headers": "Link",
+          Link: links.join(", "),
         },
       })
     })
@@ -332,6 +351,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }))
     })
 
+    const revertPreview = Effect.fn("SessionHttpApi.revertPreview")(function* (ctx: {
+      params: { sessionID: SessionID }
+    }) {
+      return yield* SessionError.mapStorageNotFound(
+        revertSvc.preview({ sessionID: ctx.params.sessionID }).pipe(Effect.map((preview) => preview ?? null)),
+      )
+    })
+
     const revert = Effect.fn("SessionHttpApi.revert")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof RevertPayload.Type
@@ -409,6 +436,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("promptAsync", promptAsync)
       .handle("command", command)
       .handle("shell", shell)
+      .handle("revertPreview", revertPreview)
       .handle("revert", revert)
       .handle("unrevert", unrevert)
       .handle("permissionRespond", permissionRespond)

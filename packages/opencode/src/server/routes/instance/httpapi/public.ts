@@ -49,6 +49,7 @@ type OpenApiSchema = {
 
 type OpenApiResponse = {
   description?: string
+  headers?: Record<string, { description?: string; schema?: OpenApiSchema }>
   content?: Record<string, { schema?: OpenApiSchema }>
 }
 
@@ -66,11 +67,48 @@ const QueryParameterSchemas: Record<string, OpenApiSchema> = {
   "GET /session roots": QueryBooleanOpenApi,
   "GET /session limit": { type: "number" },
   "GET /session/{sessionID}/message limit": { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  "GET /session/{sessionID}/message oldest": QueryBooleanOpenApi,
   "GET /api/session limit": { type: "number" },
   "GET /api/session start": { type: "number" },
   "GET /api/session roots": QueryBooleanOpenApi,
   "GET /api/session/{sessionID}/message limit": { type: "number" },
 }
+
+const PathParameterSchemas = {
+  sessionID: { type: "string", pattern: "^ses.*" },
+  messageID: { type: "string", pattern: "^msg.*" },
+  partID: { type: "string", pattern: "^prt.*" },
+  permissionID: { type: "string", pattern: "^per.*" },
+  ptyID: { type: "string", pattern: "^pty.*" },
+} satisfies Record<string, OpenApiSchema>
+
+const RevertPreviewSchema = {
+  anyOf: [
+    {
+      type: "object",
+      required: ["userCount", "items"],
+      additionalProperties: false,
+      properties: {
+        userCount: { type: "number" },
+        nextMessageID: PathParameterSchemas.messageID,
+        partID: PathParameterSchemas.partID,
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["id", "text"],
+            additionalProperties: false,
+            properties: {
+              id: PathParameterSchemas.messageID,
+              text: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+    { type: "null" },
+  ],
+} satisfies OpenApiSchema
 
 const LegacyComponentDescriptions: Record<string, string> = {
   LogLevel: "Log level",
@@ -152,6 +190,18 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
       delete operation.responses?.["401"]
       normalizeLegacyErrorResponses(operation)
       normalizeLegacyOperation(operation, path, method)
+      if (path === "/session/{sessionID}/message" && method === "get" && operation.responses?.["200"]) {
+        operation.responses["200"].headers = {
+          Link: {
+            description: "RFC 8288 pagination links for previous/next message pages",
+            schema: { type: "string" },
+          },
+        }
+      }
+      if (path === "/session/{sessionID}/revert" && method === "get") {
+        const content = operation.responses?.["200"]?.content?.["application/json"]
+        if (content) content.schema = structuredClone(RevertPreviewSchema)
+      }
       if ((path === "/event" || path === "/global/event") && method === "get") {
         // HttpApi has no first-class SSE response schema, and these handlers are
         // raw/streaming routes. Document the actual wire protocol explicitly.

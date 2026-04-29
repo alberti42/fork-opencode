@@ -9,6 +9,23 @@ import { testEffect } from "../lib/effect"
 void Log.init({ print: false })
 
 const it = testEffect(Session.defaultLayer)
+const password = process.env.OPENCODE_SERVER_PASSWORD
+const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode"
+const auth = password ? "Basic " + Buffer.from(`${username}:${password}`).toString("base64") : undefined
+
+function request(input: { directory: string; sessionID: string }) {
+  return Promise.resolve(
+    Server.Default().app.request("/tui/select-session", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-opencode-directory": input.directory,
+        ...(auth ? { Authorization: auth } : {}),
+      },
+      body: JSON.stringify({ sessionID: input.sessionID }),
+    }),
+  )
+}
 
 describe("tui.selectSession endpoint", () => {
   it.instance(
@@ -18,23 +35,10 @@ describe("tui.selectSession endpoint", () => {
         const tmp = yield* TestInstance
         const session = yield* Session.Service.use((svc) => svc.create({}))
 
-        const app = Server.Default().app
-        const response = yield* Effect.promise(() =>
-          Promise.resolve(
-            app.request("/tui/select-session", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-opencode-directory": tmp.directory,
-              },
-              body: JSON.stringify({ sessionID: session.id }),
-            }),
-          ),
-        )
+        const response = yield* Effect.promise(() => request({ directory: tmp.directory, sessionID: session.id }))
 
         expect(response.status).toBe(200)
-        const body = yield* Effect.promise(() => response.json())
-        expect(body).toBe(true)
+        expect(yield* Effect.promise(() => response.json())).toBe(true)
       }),
     { git: true },
   )
@@ -44,20 +48,8 @@ describe("tui.selectSession endpoint", () => {
     () =>
       Effect.gen(function* () {
         const tmp = yield* TestInstance
-        const nonExistentSessionID = "ses_nonexistent123"
-
-        const app = Server.Default().app
         const response = yield* Effect.promise(() =>
-          Promise.resolve(
-            app.request("/tui/select-session", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-opencode-directory": tmp.directory,
-              },
-              body: JSON.stringify({ sessionID: nonExistentSessionID }),
-            }),
-          ),
+          request({ directory: tmp.directory, sessionID: "ses_nonexistent123" }),
         )
 
         expect(response.status).toBe(404)
@@ -70,20 +62,8 @@ describe("tui.selectSession endpoint", () => {
     () =>
       Effect.gen(function* () {
         const tmp = yield* TestInstance
-        const invalidSessionID = "invalid_session_id"
-
-        const app = Server.Default().app
         const response = yield* Effect.promise(() =>
-          Promise.resolve(
-            app.request("/tui/select-session", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-opencode-directory": tmp.directory,
-              },
-              body: JSON.stringify({ sessionID: invalidSessionID }),
-            }),
-          ),
+          request({ directory: tmp.directory, sessionID: "invalid_session_id" }),
         )
 
         expect(response.status).toBe(400)

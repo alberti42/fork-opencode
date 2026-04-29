@@ -4,6 +4,12 @@ import { Binary } from "@opencode-ai/core/util/binary"
 import { retry } from "@opencode-ai/core/util/retry"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import {
+  boundaryFromMessageResponse,
+  compareMessages,
+  hasVisibleUserBeforeRevert,
+  loadRevertAwareLatestPage,
+} from "./revert-page"
+import {
   clearSessionPrefetch,
   getSessionPrefetch,
   getSessionPrefetchPromise,
@@ -16,6 +22,17 @@ import { SESSION_CACHE_LIMIT, dropSessionCaches, pickSessionCacheEvictions } fro
 import { diffs as list, message as clean } from "@/utils/diffs"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
+
+function nextBefore(link: string | null) {
+  if (!link) return undefined
+  const match = /<([^>]+)>;\s*rel="prev"/.exec(link)
+  if (!match) return undefined
+  try {
+    return new URL(match[1]).searchParams.get("before") ?? undefined
+  } catch {
+    return undefined
+  }
+}
 
 function sortParts(parts: Part[]) {
   return parts.filter((part) => !!part?.id).sort((a, b) => cmp(a.id, b.id))
@@ -35,10 +52,16 @@ const keyFor = (directory: string, id: string) => `${directory}\n${id}`
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
-function merge<T extends { id: string }>(a: readonly T[], b: readonly T[]) {
+function merge(a: readonly Message[], b: readonly Message[]) {
   const map = new Map(a.map((item) => [item.id, item] as const))
   for (const item of b) map.set(item.id, item)
-  return [...map.values()].sort((x, y) => cmp(x.id, y.id))
+  return [...map.values()].sort(compareMessages)
+}
+
+const messageIndex = (messages: readonly Message[], id: string) => messages.findIndex((message) => message.id === id)
+const messageInsertIndex = (messages: readonly Message[], message: Message) => {
+  const index = messages.findIndex((item) => compareMessages(message, item) < 0)
+  return index === -1 ? messages.length : index
 }
 
 type OptimisticStore = {
@@ -67,6 +90,7 @@ type MessagePage = {
   part: { id: string; part: Part[] }[]
   cursor?: string
   complete: boolean
+  clearedRevert?: boolean
 }
 
 const hasParts = (parts: Part[] | undefined, want: Part[]) => {
@@ -96,9 +120,9 @@ export function mergeOptimisticPage(page: MessagePage, items: OptimisticItem[]) 
   const confirmed: string[] = []
 
   for (const item of items) {
-    const result = Binary.search(session, item.message.id, (message) => message.id)
-    const found = result.found
-    if (!found) session.splice(result.index, 0, item.message)
+    const index = messageIndex(session, item.message.id)
+    const found = index !== -1
+    if (!found) session.splice(messageInsertIndex(session, item.message), 0, item.message)
 
     const current = part.get(item.message.id)
     if (found && hasParts(current, item.parts)) {
@@ -112,6 +136,7 @@ export function mergeOptimisticPage(page: MessagePage, items: OptimisticItem[]) 
   return {
     cursor: page.cursor,
     complete: page.complete,
+    clearedRevert: page.clearedRevert,
     session,
     part: [...part.entries()].sort((a, b) => cmp(a[0], b[0])).map(([id, part]) => ({ id, part })),
     confirmed,
@@ -121,8 +146,8 @@ export function mergeOptimisticPage(page: MessagePage, items: OptimisticItem[]) 
 export function applyOptimisticAdd(draft: OptimisticStore, input: OptimisticAddInput) {
   const messages = draft.message[input.sessionID]
   if (messages) {
-    const result = Binary.search(messages, input.message.id, (m) => m.id)
-    messages.splice(result.index, 0, input.message)
+    const index = messageIndex(messages, input.message.id)
+    if (index === -1) messages.splice(messageInsertIndex(messages, input.message), 0, input.message)
   } else {
     draft.message[input.sessionID] = [input.message]
   }
@@ -132,8 +157,8 @@ export function applyOptimisticAdd(draft: OptimisticStore, input: OptimisticAddI
 export function applyOptimisticRemove(draft: OptimisticStore, input: OptimisticRemoveInput) {
   const messages = draft.message[input.sessionID]
   if (messages) {
-    const result = Binary.search(messages, input.messageID, (m) => m.id)
-    if (result.found) messages.splice(result.index, 1)
+    const index = messageIndex(messages, input.messageID)
+    if (index !== -1) messages.splice(index, 1)
   }
   delete draft.part[input.messageID]
 }
@@ -141,9 +166,10 @@ export function applyOptimisticRemove(draft: OptimisticStore, input: OptimisticR
 function setOptimisticAdd(setStore: (...args: unknown[]) => void, input: OptimisticAddInput) {
   setStore("message", input.sessionID, (messages: Message[] | undefined) => {
     if (!messages) return [input.message]
-    const result = Binary.search(messages, input.message.id, (m) => m.id)
+    const index = messageIndex(messages, input.message.id)
+    if (index !== -1) return messages
     const next = [...messages]
-    next.splice(result.index, 0, input.message)
+    next.splice(messageInsertIndex(next, input.message), 0, input.message)
     return next
   })
   setStore("part", input.message.id, sortParts(input.parts))
@@ -152,10 +178,10 @@ function setOptimisticAdd(setStore: (...args: unknown[]) => void, input: Optimis
 function setOptimisticRemove(setStore: (...args: unknown[]) => void, input: OptimisticRemoveInput) {
   setStore("message", input.sessionID, (messages: Message[] | undefined) => {
     if (!messages) return messages
-    const result = Binary.search(messages, input.messageID, (m) => m.id)
-    if (!result.found) return messages
+    const index = messageIndex(messages, input.messageID)
+    if (index === -1) return messages
     const next = [...messages]
-    next.splice(result.index, 1)
+    next.splice(index, 1)
     return next
   })
   setStore("part", (part: Record<string, Part[] | undefined>) => {
@@ -296,20 +322,47 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       sessionID: string
       limit: number
       before?: string
+      revertMessageID?: string
     }) => {
+      const toPage = (messages: Awaited<ReturnType<typeof input.client.session.messages>>) => {
+        const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
+        const session = items.map((x) => clean(x.info)).sort(compareMessages)
+        const part = items.map((message) => ({ id: message.info.id, part: sortParts(message.parts) }))
+        const cursor = nextBefore(messages.response.headers.get("Link"))
+        return {
+          session,
+          part,
+          cursor,
+          complete: !cursor,
+        }
+      }
+
       const messages = await retry(() =>
         input.client.session.messages({ sessionID: input.sessionID, limit: input.limit, before: input.before }),
       )
-      const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
-      const session = items.map((x) => clean(x.info)).sort((a, b) => cmp(a.id, b.id))
-      const part = items.map((message) => ({ id: message.info.id, part: sortParts(message.parts) }))
-      const cursor = messages.response.headers.get("x-next-cursor") ?? undefined
-      return {
-        session,
-        part,
-        cursor,
-        complete: !cursor,
-      }
+      const page = toPage(messages)
+      if (input.before) return page
+      return loadRevertAwareLatestPage({
+        current: page,
+        revertMessageID: input.revertMessageID,
+        fetchMessage: (messageID) =>
+          retry(() =>
+            input.client.session.message({ sessionID: input.sessionID, messageID }, { throwOnError: false }),
+          ).then((result) => {
+            const boundary = boundaryFromMessageResponse(result)
+            if (!boundary) return undefined
+            const cursor = "cursor" in boundary ? boundary.cursor : undefined
+            return {
+              info: clean(boundary.info),
+              parts: sortParts(boundary.parts),
+              cursor: typeof cursor === "string" ? cursor : undefined,
+            }
+          }),
+        fetchPage: (before) =>
+          retry(() => input.client.session.messages({ sessionID: input.sessionID, limit: input.limit, before })).then(
+            toPage,
+          ),
+      })
     }
 
     const tracked = (directory: string, sessionID: string) => seen.get(directory)?.has(sessionID) ?? false
@@ -321,6 +374,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       sessionID: string
       limit: number
       before?: string
+      revertMessageID?: string
       mode?: "replace" | "prepend"
     }) => {
       const key = keyFor(input.directory, input.sessionID)
@@ -342,6 +396,16 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             for (const p of next.part) {
               const filtered = p.part.filter((x) => !SKIP_PARTS.has(x.type))
               if (filtered.length) input.setStore("part", p.id, filtered)
+            }
+            if (next.clearedRevert) {
+              input.setStore(
+                "session",
+                produce((draft) => {
+                  const match = Binary.search(draft, input.sessionID, (s) => s.id)
+                  if (!match.found) return
+                  draft[match.index] = { ...draft[match.index], revert: undefined }
+                }),
+              )
             }
             setMeta("limit", key, message.length)
             setMeta("cursor", key, next.cursor)
@@ -460,18 +524,24 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
               }
             }
 
-            const hasSession = Binary.search(store.session, sessionID, (s) => s.id).found
+            const sessionMatch = Binary.search(store.session, sessionID, (s) => s.id)
+            const sessionInfo = sessionMatch.found ? store.session[sessionMatch.index] : undefined
             const cached = store.message[sessionID] !== undefined && meta.limit[key] !== undefined
-            if (cached && hasSession && !opts?.force) return
+            const canReuseCached = !!(
+              cached &&
+              sessionInfo &&
+              hasVisibleUserBeforeRevert(store.message[sessionID] ?? [], sessionInfo.revert?.messageID)
+            )
+            if (canReuseCached && !opts?.force) return
 
             const limit = meta.limit[key] ?? initialMessagePageSize
-            const sessionReq =
-              hasSession && !opts?.force
-                ? Promise.resolve()
-                : retry(() => client.session.get({ sessionID })).then((session) => {
-                    if (!tracked(directory, sessionID)) return
+            const nextSession =
+              sessionInfo && !opts?.force
+                ? sessionInfo
+                : await retry(() => client.session.get({ sessionID })).then((session) => {
+                    if (!tracked(directory, sessionID)) return undefined
                     const data = session.data
-                    if (!data) return
+                    if (!data) return undefined
                     setStore(
                       "session",
                       produce((draft) => {
@@ -483,10 +553,11 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                         draft.splice(match.index, 0, data)
                       }),
                     )
+                    return data
                   })
 
             const messagesReq =
-              cached && !opts?.force
+              canReuseCached && !opts?.force
                 ? Promise.resolve()
                 : loadMessages({
                     directory,
@@ -494,9 +565,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                     setStore,
                     sessionID,
                     limit,
+                    revertMessageID: nextSession?.revert?.messageID,
                   })
 
-            await Promise.all([sessionReq, messagesReq])
+            await messagesReq
           })
         },
         async diff(sessionID: string, opts?: { force?: boolean }) {

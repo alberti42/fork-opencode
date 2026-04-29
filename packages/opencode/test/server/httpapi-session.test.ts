@@ -23,6 +23,7 @@ import { SessionMessage } from "@opencode-ai/core/session-message"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
+import { linkParam, parseLinkHeader } from "../../src/util/link-header"
 import * as Log from "@opencode-ai/core/util/log"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
@@ -198,7 +199,7 @@ afterEach(async () => {
 
 describe("session HttpApi", () => {
   it.instance(
-    "returns declared not found errors for read routes",
+    "returns declared not found errors for missing sessions and messages",
     () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
@@ -232,8 +233,9 @@ describe("session HttpApi", () => {
         expect(remove.status).toBe(404)
         expect(yield* responseJson(remove)).toEqual(missingSessionBody)
 
+        const jsonHeaders = { ...headers, "content-type": "application/json" }
         const prompt = yield* request(pathFor(SessionPaths.prompt, { sessionID: missingSession }), {
-          headers: { ...headers, "content-type": "application/json" },
+          headers: jsonHeaders,
           method: "POST",
           body: JSON.stringify({ agent: "build", noReply: true, parts: [{ type: "text", text: "hello" }] }),
         })
@@ -246,6 +248,25 @@ describe("session HttpApi", () => {
         })
         expect(abort.status).toBe(200)
         expect(yield* responseJson(abort)).toBe(true)
+
+        const revertPreview = yield* request(pathFor(SessionPaths.revert, { sessionID: missingSession }), { headers })
+        expect(revertPreview.status).toBe(404)
+        expect(yield* responseJson(revertPreview)).toEqual(missingSessionBody)
+
+        const revert = yield* request(pathFor(SessionPaths.revert, { sessionID: missingSession }), {
+          method: "POST",
+          headers: jsonHeaders,
+          body: JSON.stringify({ messageID: MessageID.ascending() }),
+        })
+        expect(revert.status).toBe(404)
+        expect(yield* responseJson(revert)).toEqual(missingSessionBody)
+
+        const unrevert = yield* request(pathFor(SessionPaths.unrevert, { sessionID: missingSession }), {
+          method: "POST",
+          headers: jsonHeaders,
+        })
+        expect(unrevert.status).toBe(404)
+        expect(yield* responseJson(unrevert)).toEqual(missingSessionBody)
 
         const session = yield* createSession({ title: "missing message" })
         const missingMessage = MessageID.ascending()
@@ -301,20 +322,28 @@ describe("session HttpApi", () => {
           headers,
         })
         const messagePage = yield* json<MessageV2.WithParts[]>(messages)
-        const nextCursor = messages.headers.get("x-next-cursor")
-        expect(nextCursor).toBeTruthy()
+        const links = parseLinkHeader(messages.headers.get("link") ?? "")
+        const before = linkParam(links.prev, "before")
+        expect(before).toBeTruthy()
         expect(messagePage[0]?.parts[0]).toMatchObject({ type: "text" })
 
-        expect(
-          (yield* request(`${pathFor(SessionPaths.messages, { sessionID: parent.id })}?before=${nextCursor}`, {
-            headers,
-          })).status,
-        ).toBe(400)
+        const older = yield* request(`${pathFor(SessionPaths.messages, { sessionID: parent.id })}?before=${before}`, {
+          headers,
+        })
+        expect(older.status).toBe(200)
+        expect(older.headers.get("x-next-cursor")).toBeNull()
+        expect(parseLinkHeader(older.headers.get("link") ?? "").next).toBeTruthy()
         expect(
           (yield* request(`${pathFor(SessionPaths.messages, { sessionID: parent.id })}?limit=1&before=invalid`, {
             headers,
           })).status,
         ).toBe(400)
+
+        const explicitFalse = yield* requestJson<MessageV2.WithParts[]>(
+          `${pathFor(SessionPaths.messages, { sessionID: parent.id })}?oldest=false`,
+          { headers },
+        )
+        expect(explicitFalse.map((item) => item.info.id)).toEqual([message.info.id, messagePage[0]!.info.id])
 
         expect(
           yield* requestJson<MessageV2.WithParts>(
@@ -498,13 +527,35 @@ describe("session HttpApi", () => {
         const session = yield* createSession({ title: "messages" })
         yield* createTextMessage(session.id, "first")
         yield* createTextMessage(session.id, "second")
-        const route = `${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=1`
+        const route = `${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=1&auth_token=secret-token`
 
         const response = yield* request(route, { headers })
 
-        expect(response.headers.get("x-next-cursor")).toBeTruthy()
+        expect(response.headers.get("x-next-cursor")).toBeNull()
         expect(response.headers.get("link")).toContain("limit=1")
-        expect(response.headers.get("access-control-expose-headers")?.toLowerCase()).toContain("x-next-cursor")
+        expect(linkParam(parseLinkHeader(response.headers.get("link") ?? "").prev, "auth_token")).toBeUndefined()
+        expect(response.headers.get("link")).not.toContain("secret-token")
+        expect(response.headers.get("access-control-expose-headers")?.toLowerCase()).toContain("link")
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "validates incompatible paginated message cursors",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "messages" })
+        yield* createTextMessage(session.id, "first")
+        yield* createTextMessage(session.id, "second")
+        const first = yield* request(`${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=1`, {
+          headers,
+        })
+        const cursor = linkParam(parseLinkHeader(first.headers.get("link") ?? "").prev, "before")
+        const route = `${pathFor(SessionPaths.messages, { sessionID: session.id })}?before=${cursor}&after=${cursor}&limit=1`
+
+        expect((yield* request(route, { headers })).status).toBe(400)
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )
@@ -552,6 +603,45 @@ describe("session HttpApi", () => {
         ).toBe(true)
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "serves revert preview",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const session = yield* createSession({ title: "revert preview" })
+        yield* createTextMessage(session.id, "first")
+        const second = yield* createTextMessage(session.id, "second")
+        const third = yield* createTextMessage(session.id, "third")
+
+        expect(
+          yield* requestJson<Session.Info>(pathFor(SessionPaths.revert, { sessionID: session.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ messageID: second.info.id }),
+          }),
+        ).toMatchObject({ id: session.id })
+
+        const preview = yield* requestJson<{
+          userCount: number
+          nextMessageID?: string
+          items: { id: string; text: string }[]
+        }>(pathFor(SessionPaths.revert, { sessionID: session.id }), { headers })
+
+        expect(preview.userCount).toBe(2)
+        expect(preview.nextMessageID).toBe(third.info.id)
+        expect(preview.items).toEqual([
+          { id: second.info.id, text: "second" },
+          { id: third.info.id, text: "third" },
+        ])
+
+        expect((yield* request(pathFor(SessionPaths.revert, { sessionID: "ses_missing" }), { headers })).status).toBe(
+          404,
+        )
+      }),
+    { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
   )
 
   it.instance(

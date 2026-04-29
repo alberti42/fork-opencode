@@ -16,6 +16,7 @@ import { makeEventListener } from "@solid-primitives/event-listener"
 import { useLocation, useNavigate, useParams } from "@solidjs/router"
 import { useLayout, LocalProject } from "@/context/layout"
 import { useGlobalSync } from "@/context/global-sync"
+import { compareMessages } from "@/context/revert-page"
 import { Persist, persisted } from "@/utils/persist"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { decode64 } from "@/utils/base64"
@@ -675,6 +676,17 @@ export default function Layout(props: ParentProps) {
     running: number
   }
 
+  function nextBefore(link: string | null) {
+    if (!link) return undefined
+    const match = /<([^>]+)>;\s*rel="prev"/.exec(link)
+    if (!match) return undefined
+    try {
+      return new URL(match[1]).searchParams.get("before") ?? undefined
+    } catch {
+      return undefined
+    }
+  }
+
   const prefetchChunk = 200
   const prefetchConcurrency = 2
   const prefetchPendingLimit = 10
@@ -759,6 +771,15 @@ export default function Layout(props: ParentProps) {
     return [...map.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   }
 
+  const mergeMessages = (current: Message[], incoming: Message[]) => {
+    if (current.length === 0) return incoming.slice().sort(compareMessages)
+
+    const map = new Map<string, Message>()
+    for (const item of current) map.set(item.id, item)
+    for (const item of incoming) map.set(item.id, item)
+    return [...map.values()].sort(compareMessages)
+  }
+
   async function prefetchMessages(directory: string, sessionID: string, token: number) {
     const [store, setStore] = globalSync.child(directory, { bootstrap: false })
 
@@ -773,9 +794,9 @@ export default function Layout(props: ParentProps) {
 
             const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
             const next = items.map((x) => x.info).filter((m): m is Message => !!m?.id)
-            const sorted = mergeByID([], next)
+            const sorted = mergeMessages([], next)
             const stale = markPrefetched(directory, sessionID)
-            const cursor = messages.response.headers.get("x-next-cursor") ?? undefined
+            const cursor = nextBefore(messages.response.headers.get("Link"))
             const meta = {
               limit: sorted.length,
               cursor,
@@ -791,7 +812,7 @@ export default function Layout(props: ParentProps) {
             }
 
             const current = store.message[sessionID] ?? []
-            const merged = mergeByID(
+            const merged = mergeMessages(
               current.filter((item): item is Message => !!item?.id),
               sorted,
             )

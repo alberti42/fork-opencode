@@ -5797,6 +5797,8 @@ export type SessionMessagesData = {
     workspace?: string
     limit?: number
     before?: string
+    after?: string
+    oldest?: boolean | "true" | "false"
   }
   url: "/session/{sessionID}/message"
 }
@@ -5821,6 +5823,7 @@ export type SessionMessagesResponses = {
   200: Array<{
     info: Message
     parts: Array<Part>
+    cursor?: string
   }>
 }
 
@@ -5946,6 +5949,7 @@ export type SessionMessageResponses = {
   200: {
     info: Message
     parts: Array<Part>
+    cursor?: string
   }
 }
 
@@ -6302,10 +6306,53 @@ export type SessionShellResponses = {
   200: {
     info: Message
     parts: Array<Part>
+    cursor?: string
   }
 }
 
 export type SessionShellResponse = SessionShellResponses[keyof SessionShellResponses]
+
+export type SessionRevertPreviewData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/revert"
+}
+
+export type SessionRevertPreviewErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionRevertPreviewError = SessionRevertPreviewErrors[keyof SessionRevertPreviewErrors]
+
+export type SessionRevertPreviewResponses = {
+  /**
+   * Revert preview
+   */
+  200: {
+    userCount: number
+    nextMessageID?: string
+    partID?: string
+    items: Array<{
+      id: string
+      text: string
+    }>
+  } | null
+}
+
+export type SessionRevertPreviewResponse = SessionRevertPreviewResponses[keyof SessionRevertPreviewResponses]
 
 export type SessionRevertData = {
   body?: {
