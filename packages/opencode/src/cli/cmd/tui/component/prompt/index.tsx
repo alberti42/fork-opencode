@@ -68,6 +68,7 @@ export type PromptProps = {
   workspaceID?: string
   visible?: boolean
   disabled?: boolean
+  beforeSubmit?: (sessionID: string) => boolean | void | Promise<boolean | void>
   onSubmit?: () => void
   ref?: (ref: PromptRef | undefined) => void
   hint?: JSX.Element
@@ -1135,6 +1136,8 @@ export function Prompt(props: PromptProps) {
             },
           ]
         : []
+
+    if ((await props.beforeSubmit?.(sessionID)) === false) return false
 
     if (store.mode === "shell") {
       void sdk.client.session.shell({

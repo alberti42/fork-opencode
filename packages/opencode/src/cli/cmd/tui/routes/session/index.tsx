@@ -22,16 +22,24 @@ import { useEvent } from "@tui/context/event"
 import { SplitBorder } from "@tui/component/border"
 import { Spinner } from "@tui/component/spinner"
 import { selectedForeground, useTheme } from "@tui/context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
+import {
+  BoxRenderable,
+  ScrollBoxRenderable,
+  addDefaultParsers,
+  MacOSScrollAccel,
+  type ScrollAcceleration,
+  TextAttributes,
+  RGBA,
+} from "@opentui/core"
 import { Prompt, type PromptRef } from "@tui/component/prompt"
 import type {
   AssistantMessage,
   Part,
-  Provider,
   ToolPart,
   UserMessage,
   TextPart,
   ReasoningPart,
+  Provider,
 } from "@opencode-ai/sdk/v2"
 import { useLocal } from "@tui/context/local"
 import { Locale } from "@/util/locale"
@@ -72,14 +80,15 @@ import { Toast, useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv.tsx"
 import * as Editor from "../../util/editor"
 import stripAnsi from "strip-ansi"
+import { Footer } from "./footer.tsx"
 import { usePromptRef } from "../../context/prompt"
 import { useExit } from "../../context/exit"
 import { Filesystem } from "@/util/filesystem"
 import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
-import * as Model from "../../util/model"
 import { formatTranscript } from "../../util/transcript"
+import * as Model from "../../util/model"
 import { UI } from "@/cli/ui.ts"
 import { useTuiConfig } from "../../context/tui-config"
 import { getScrollAcceleration } from "../../util/scroll"
@@ -90,6 +99,7 @@ import { getRevertDiffFiles } from "../../util/revert-diff"
 import { useCommandPalette } from "../../context/command-palette"
 import { useBindings, useCommandShortcut } from "../../keymap"
 import { PathFormatterProvider, usePathFormatter } from "../../context/path-format"
+import { edgeHints, messageBefore, olderScrollTarget, queueBoundaryLoad } from "@tui/util/pagination"
 
 addDefaultParsers(parsers.parsers)
 
@@ -191,6 +201,8 @@ export function Session() {
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
+  const paging = createMemo(() => sync.data.message_page[route.sessionID])
+  const providers = createMemo(() => Model.index(sync.data.provider))
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
     return children().flatMap((x) => sync.data.permission[x.id] ?? [])
@@ -201,6 +213,67 @@ export function Session() {
   })
   const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
+
+  const LOAD_MORE_THRESHOLD = 5
+
+  const loadOlder = () => {
+    const page = paging()
+    if (!page?.hasOlder || page.loading || !scroll || scroll.isDestroyed) return
+    if (scroll.scrollTop > LOAD_MORE_THRESHOLD) return
+
+    const anchor = (() => {
+      const scrollTop = scroll.scrollTop
+      const children = scroll.getChildren()
+      for (const child of children) {
+        if (!child.id) continue
+        if (child.y + child.height > scrollTop) {
+          return { id: child.id, offset: scrollTop - child.y }
+        }
+      }
+      return undefined
+    })()
+
+    const height = scroll.scrollHeight
+    const scrollTop = scroll.scrollTop
+    sync.session.loadOlder(route.sessionID).then(() => {
+      queueMicrotask(() => {
+        requestAnimationFrame(() => {
+          if (!scroll || scroll.isDestroyed) return
+          const nextTop = olderScrollTarget(scroll.getChildren(), scroll.scrollHeight, height, scrollTop, anchor)
+          if (nextTop !== undefined) scroll.scrollTo(nextTop)
+          refreshEdges()
+        })
+      })
+    })
+  }
+
+  const loadNewer = () => {
+    const page = paging()
+    if (!page?.hasNewer || page.loading || !scroll || scroll.isDestroyed) return
+    const bottomDistance = scroll.scrollHeight - scroll.scrollTop - scroll.viewport.height
+    if (bottomDistance > LOAD_MORE_THRESHOLD) return
+    sync.session.loadNewer(route.sessionID).then(() => {
+      queueMicrotask(() => {
+        requestAnimationFrame(() => {
+          refreshEdges()
+        })
+      })
+    })
+  }
+
+  const refreshEdges = () => {
+    if (!scroll || scroll.isDestroyed) return
+    const edges = edgeHints(scroll.scrollTop, scroll.scrollHeight, scroll.viewport.height, HINT_THRESHOLD)
+    setNearTop(edges.nearTop)
+    setNearBottom(edges.nearBottom)
+  }
+
+  const scrollMove = (delta: number) => {
+    if (!scroll || scroll.isDestroyed) return
+    scroll.scrollBy(delta)
+    refreshEdges()
+    queueBoundaryLoad(delta, loadOlder, loadNewer)
+  }
 
   const pending = createMemo(() => {
     return messages().findLast((x) => x.role === "assistant" && !x.time.completed)?.id
@@ -219,9 +292,14 @@ export function Session() {
   const [showDetails, setShowDetails] = kv.signal("tool_details_visibility", true)
   const [showAssistantMetadata, _setShowAssistantMetadata] = kv.signal("assistant_metadata_visibility", true)
   const [showScrollbar, setShowScrollbar] = kv.signal("scrollbar_visible", false)
+  const [showHeader, setShowHeader] = kv.signal("header_visible", true)
   const [diffWrapMode] = kv.signal<"word" | "none">("diff_wrap_mode", "word")
   const [_animationsEnabled, _setAnimationsEnabled] = kv.signal("animations_enabled", true)
   const [showGenericToolOutput, setShowGenericToolOutput] = kv.signal("generic_tool_output_visibility", false)
+  const [nearTop, setNearTop] = createSignal(false)
+  const [nearBottom, setNearBottom] = createSignal(false)
+  const [revertPreview, setRevertPreview] = createSignal<{ userCount: number; nextMessageID?: string }>()
+  const HINT_THRESHOLD = 20
 
   const wide = createMemo(() => dimensions().width > 120)
   const sidebarVisible = createMemo(() => {
@@ -232,7 +310,6 @@ export function Session() {
   })
   const showTimestamps = createMemo(() => timestamps() === "show")
   const contentWidth = createMemo(() => dimensions().width - (sidebarVisible() ? 42 : 0) - 4)
-  const providers = createMemo(() => Model.index(sync.data.provider))
 
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
   const toast = useToast()
@@ -267,7 +344,9 @@ export function Session() {
       }
       editor.reconnect(result.data.directory)
       await sync.session.sync(sessionID)
-      if (route.sessionID === sessionID && scroll) scroll.scrollBy(100_000)
+      if (route.sessionID !== sessionID || !scroll || scroll.isDestroyed) return
+      scroll.scrollBy(100_000)
+      refreshEdges()
     })().catch((error) => {
       if (route.sessionID !== sessionID) return
       toast.show({
@@ -276,6 +355,16 @@ export function Session() {
         duration: 5000,
       })
       navigate({ type: "home" })
+    })
+  })
+
+  createEffect(() => {
+    if (!scroll || scroll.isDestroyed) return
+    messages()
+    queueMicrotask(() => {
+      requestAnimationFrame(() => {
+        refreshEdges()
+      })
     })
   })
 
@@ -355,7 +444,7 @@ export function Session() {
   const findNextVisibleMessage = (direction: "next" | "prev"): string | null => {
     const children = scroll.getChildren()
     const messagesList = messages()
-    const scrollTop = scroll.y
+    const scrollTop = scroll.scrollTop
 
     // Get visible messages sorted by position, filtering for valid non-synthetic, non-ignored content
     const visibleMessages = children
@@ -387,13 +476,16 @@ export function Session() {
     const targetID = findNextVisibleMessage(direction)
 
     if (!targetID) {
-      scroll.scrollBy(direction === "next" ? scroll.height : -scroll.height)
+      scrollMove(direction === "next" ? scroll.height : -scroll.height)
       dialog.clear()
       return
     }
 
     const child = scroll.getChildren().find((c) => c.id === targetID)
-    if (child) scroll.scrollBy(child.y - scroll.y - 1)
+    if (child) {
+      scroll.scrollBy(child.y - scroll.scrollTop - 1)
+      refreshEdges()
+    }
     dialog.clear()
   }
 
@@ -401,7 +493,20 @@ export function Session() {
     setTimeout(() => {
       if (!scroll || scroll.isDestroyed) return
       scroll.scrollTo(scroll.scrollHeight)
+      requestAnimationFrame(() => {
+        refreshEdges()
+      })
     }, 50)
+  }
+
+  async function beforeSubmit() {
+    const page = paging()
+    if (!page?.hasNewer) return
+    if (page.loading) return false
+
+    await sync.session.jumpToLatest(route.sessionID)
+    const next = paging()
+    return !next?.hasNewer && !next?.loading
   }
 
   const local = useLocal()
@@ -421,7 +526,7 @@ export function Session() {
     if (children().length === 1) return
 
     const sessions = children().filter((x) => !!x.parentID)
-    let next = sessions.findIndex((x) => x.id === session()?.id) - direction
+    let next = sessions.findIndex((x) => x.id === session()?.id) + direction
 
     if (next >= sessions.length) next = 0
     if (next < 0) next = sessions.length - 1
@@ -505,7 +610,10 @@ export function Session() {
               const child = scroll.getChildren().find((child) => {
                 return child.id === messageID
               })
-              if (child) scroll.scrollBy(child.y - scroll.y - 1)
+              if (child) {
+                scroll.scrollBy(child.y - scroll.scrollTop - 1)
+                refreshEdges()
+              }
             }}
             sessionID={route.sessionID}
             setPrompt={(promptInfo) => prompt?.set(promptInfo)}
@@ -528,7 +636,10 @@ export function Session() {
               const child = scroll.getChildren().find((child) => {
                 return child.id === messageID
               })
-              if (child) scroll.scrollBy(child.y - scroll.y - 1)
+              if (child) {
+                scroll.scrollBy(child.y - scroll.scrollTop - 1)
+                refreshEdges()
+              }
             }}
             sessionID={route.sessionID}
           />
@@ -594,8 +705,17 @@ export function Session() {
       run: async () => {
         const status = sync.data.session_status?.[route.sessionID]
         if (status?.type !== "idle") await sdk.client.session.abort({ sessionID: route.sessionID }).catch(() => {})
-        const revert = session()?.revert?.messageID
-        const message = messages().findLast((x) => (!revert || x.id < revert) && x.role === "user")
+        const page = paging()
+        if (page?.hasNewer && page.loading) return
+        if (page?.hasNewer) {
+          await sync.session.jumpToLatest(route.sessionID)
+          const next = paging()
+          if (next?.hasNewer || next?.loading) return
+        }
+        const boundary = revertBoundary()
+        const message = (sync.data.message[route.sessionID] ?? []).findLast(
+          (x) => x.role === "user" && (!boundary || messageBefore(x, boundary)),
+        )
         if (!message) return
         void sdk.client.session
           .revert({
@@ -629,12 +749,17 @@ export function Session() {
       slash: {
         name: "redo",
       },
-      run: () => {
+      run: async () => {
         dialog.clear()
-        const messageID = session()?.revert?.messageID
-        if (!messageID) return
-        const message = messages().find((x) => x.role === "user" && x.id > messageID)
-        if (!message) {
+        const preview =
+          revertPreview() ??
+          (await sdk.client.session
+            .revertPreview({ sessionID: route.sessionID })
+            .then((result) => result.data ?? undefined)) ??
+          undefined
+        const nextMessageID = preview?.nextMessageID
+        if (!preview && session()?.revert?.messageID) return
+        if (!nextMessageID) {
           void sdk.client.session.unrevert({
             sessionID: route.sessionID,
           })
@@ -643,7 +768,7 @@ export function Session() {
         }
         void sdk.client.session.revert({
           sessionID: route.sessionID,
-          messageID: message.id,
+          messageID: nextMessageID,
         })
       },
     },
@@ -714,6 +839,15 @@ export function Session() {
       },
     },
     {
+      title: showHeader() ? "Hide header" : "Show header",
+      value: "session.toggle.header",
+      category: "Session",
+      run: () => {
+        setShowHeader((prev) => !prev)
+        dialog.clear()
+      },
+    },
+    {
       title: showGenericToolOutput() ? "Hide generic tool output" : "Show generic tool output",
       value: "session.toggle.generic_tool_output",
       category: "Session",
@@ -728,7 +862,7 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollBy(-scroll.height / 2)
+        scrollMove(-scroll.height / 2)
         dialog.clear()
       },
     },
@@ -738,7 +872,7 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollBy(scroll.height / 2)
+        scrollMove(scroll.height / 2)
         dialog.clear()
       },
     },
@@ -748,7 +882,7 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollBy(-1)
+        scrollMove(-1)
         dialog.clear()
       },
     },
@@ -758,7 +892,7 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollBy(1)
+        scrollMove(1)
         dialog.clear()
       },
     },
@@ -768,7 +902,7 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollBy(-scroll.height / 4)
+        scrollMove(-scroll.height / 4)
         dialog.clear()
       },
     },
@@ -778,7 +912,7 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollBy(scroll.height / 4)
+        scrollMove(scroll.height / 4)
         dialog.clear()
       },
     },
@@ -788,7 +922,23 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollTo(0)
+        const page = paging()
+        if (page?.hasOlder && !page.loading) {
+          sync.session.jumpToOldest(route.sessionID).then(() => {
+            requestAnimationFrame(() => {
+              if (!scroll || scroll.isDestroyed) return
+              scroll.scrollTo(0)
+              refreshEdges()
+            })
+          })
+        } else {
+          if (!scroll || scroll.isDestroyed) {
+            dialog.clear()
+            return
+          }
+          scroll.scrollTo(0)
+          refreshEdges()
+        }
         dialog.clear()
       },
     },
@@ -798,7 +948,23 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollTo(scroll.scrollHeight)
+        const page = paging()
+        if (page?.hasNewer && !page.loading) {
+          sync.session.jumpToLatest(route.sessionID).then(() => {
+            requestAnimationFrame(() => {
+              if (!scroll || scroll.isDestroyed) return
+              scroll.scrollTo(scroll.scrollHeight)
+              refreshEdges()
+            })
+          })
+        } else {
+          if (!scroll || scroll.isDestroyed) {
+            dialog.clear()
+            return
+          }
+          scroll.scrollTo(scroll.scrollHeight)
+          refreshEdges()
+        }
         dialog.clear()
       },
     },
@@ -827,7 +993,10 @@ export function Session() {
             const child = scroll.getChildren().find((child) => {
               return child.id === message.id
             })
-            if (child) scroll.scrollBy(child.y - scroll.y - 1)
+            if (child) {
+              scroll.scrollBy(child.y - scroll.scrollTop - 1)
+              refreshEdges()
+            }
             break
           }
         }
@@ -851,10 +1020,13 @@ export function Session() {
       title: "Copy last assistant message",
       value: "messages.copy",
       category: "Session",
-      run: () => {
-        const revertID = session()?.revert?.messageID
-        const lastAssistantMessage = messages().findLast(
-          (msg) => msg.role === "assistant" && (!revertID || msg.id < revertID),
+      run: async () => {
+        const boundary = revertBoundary()
+        const sessionMessages = paging()?.hasNewer
+          ? await sync.session.allMessages(route.sessionID)
+          : messages().map((info) => ({ info, parts: sync.data.part[info.id] ?? [] }))
+        const lastAssistantMessage = sessionMessages.findLast(
+          (msg) => msg.info.role === "assistant" && (!boundary || messageBefore(msg.info, boundary)),
         )
         if (!lastAssistantMessage) {
           toast.show({ message: "No assistant messages found", variant: "error" })
@@ -862,7 +1034,7 @@ export function Session() {
           return
         }
 
-        const parts = sync.data.part[lastAssistantMessage.id] ?? []
+        const parts = lastAssistantMessage.parts
         const textParts = parts.filter((part) => part.type === "text")
         if (textParts.length === 0) {
           toast.show({ message: "No text parts found in last assistant message", variant: "error" })
@@ -900,10 +1072,10 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
+          const sessionMessages = await sync.session.allMessages(route.sessionID)
           const transcript = formatTranscript(
             sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
+            sessionMessages.map((msg) => ({ info: msg.info, parts: msg.parts })),
             {
               thinking: showThinking(),
               toolDetails: showDetails(),
@@ -930,7 +1102,7 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
+          const sessionMessages = await sync.session.allMessages(route.sessionID)
 
           const defaultFilename = `session-${sessionData.id.slice(0, 8)}.md`
 
@@ -947,7 +1119,7 @@ export function Session() {
 
           const transcript = formatTranscript(
             sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
+            sessionMessages.map((msg) => ({ info: msg.info, parts: msg.parts })),
             {
               thinking: options.thinking,
               toolDetails: options.toolDetails,
@@ -1053,13 +1225,47 @@ export function Session() {
 
   const revertInfo = createMemo(() => session()?.revert)
   const revertMessageID = createMemo(() => revertInfo()?.messageID)
+  let revertPreviewEpoch = 0
+
+  createEffect(
+    on(
+      () => [route.sessionID, revertMessageID()] as const,
+      ([sessionID, revert]) => {
+        const epoch = ++revertPreviewEpoch
+        setRevertPreview(undefined)
+        if (!revert) {
+          return
+        }
+        void sdk.client.session
+          .revertPreview({ sessionID })
+          .then((result) => {
+            if (epoch !== revertPreviewEpoch) return
+            setRevertPreview(result.data ?? undefined)
+          })
+          .catch(() => {
+            if (epoch !== revertPreviewEpoch) return
+            setRevertPreview(undefined)
+          })
+      },
+      { defer: true },
+    ),
+  )
 
   const revertDiffFiles = createMemo(() => getRevertDiffFiles(revertInfo()?.diff ?? ""))
 
   const revertRevertedMessages = createMemo(() => {
     const messageID = revertMessageID()
     if (!messageID) return []
-    return messages().filter((x) => x.id >= messageID && x.role === "user")
+    const boundary = messages().find((x) => x.id === messageID)
+    if (!boundary) return []
+    return messages().filter((x) => x.role === "user" && !messageBefore(x, boundary))
+  })
+  const revertUserCount = createMemo(() => revertPreview()?.userCount ?? revertRevertedMessages().length)
+
+  const revertBoundary = createMemo(() => {
+    const messageID = revertMessageID()
+    if (!messageID) return undefined
+    return messages().find((x) => x.id === messageID)
   })
 
   const revert = createMemo(() => {
@@ -1068,7 +1274,7 @@ export function Session() {
     if (!info.messageID) return
     return {
       messageID: info.messageID,
-      reverted: revertRevertedMessages(),
+      revertedCount: revertUserCount(),
       diff: info.diff,
       diffFiles: revertDiffFiles(),
     }
@@ -1097,10 +1303,46 @@ export function Session() {
         }}
       >
         <box flexDirection="row" flexGrow={1} minHeight={0}>
-          <box flexGrow={1} minHeight={0} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1}>
+          <box flexGrow={1} minHeight={0} paddingBottom={1} paddingTop={1} paddingLeft={2} paddingRight={2} gap={1}>
             <Show when={session()}>
+              <Show when={paging()?.loading && paging()?.loadingDirection === "older"}>
+                <box flexShrink={0} paddingLeft={1}>
+                  <text fg={theme.textMuted}>Loading older messages...</text>
+                </box>
+              </Show>
+              <Show when={!paging()?.loading && paging()?.hasOlder && nearTop()}>
+                <box flexShrink={0} paddingLeft={1}>
+                  <text fg={theme.textMuted}>(scroll up for more)</text>
+                </box>
+              </Show>
+              <Show when={paging()?.error}>
+                <box flexShrink={0} paddingLeft={1}>
+                  <text fg={theme.error}>Failed to load: {paging()?.error}</text>
+                  <text fg={theme.textMuted}> (scroll to retry)</text>
+                </box>
+              </Show>
               <scrollbox
                 ref={(r) => (scroll = r)}
+                onMouseScroll={() => {
+                  refreshEdges()
+                  loadOlder()
+                  loadNewer()
+                }}
+                onKeyDown={(e) => {
+                  if (["up", "pageup", "home"].includes(e.name)) {
+                    setTimeout(() => {
+                      refreshEdges()
+                      loadOlder()
+                    }, 0)
+                  }
+                  if (["down", "pagedown", "end"].includes(e.name)) {
+                    setTimeout(() => {
+                      refreshEdges()
+                      loadNewer()
+                    }, 0)
+                  }
+                }}
+                viewportCulling={true}
                 viewportOptions={{
                   paddingRight: showScrollbar() ? 1 : 0,
                 }}
@@ -1117,7 +1359,6 @@ export function Session() {
                 flexGrow={1}
                 scrollAcceleration={scrollAcceleration()}
               >
-                <box height={1} />
                 <For each={messages()}>
                   {(message, index) => (
                     <Switch>
@@ -1156,7 +1397,7 @@ export function Session() {
                                 paddingLeft={2}
                                 backgroundColor={hover() ? theme.backgroundElement : theme.backgroundPanel}
                               >
-                                <text fg={theme.textMuted}>{revert()!.reverted.length} message reverted</text>
+                                <text fg={theme.textMuted}>{revert()!.revertedCount} message reverted</text>
                                 <text fg={theme.textMuted}>
                                   <span style={{ fg: theme.text }}>{redoShortcut()}</span> or /redo to restore
                                 </text>
@@ -1182,7 +1423,13 @@ export function Session() {
                           )
                         })()}
                       </Match>
-                      <Match when={revert()?.messageID && message.id >= revert()!.messageID}>
+                      <Match
+                        when={(() => {
+                          const boundary = revertBoundary()
+                          if (!boundary) return false
+                          return !messageBefore(message, boundary)
+                        })()}
+                      >
                         <></>
                       </Match>
                       <Match when={message.role === "user"}>
@@ -1214,6 +1461,16 @@ export function Session() {
                   )}
                 </For>
               </scrollbox>
+              <Show when={paging()?.loading && paging()?.loadingDirection === "newer"}>
+                <box flexShrink={0} paddingLeft={1}>
+                  <text fg={theme.textMuted}>Loading newer messages...</text>
+                </box>
+              </Show>
+              <Show when={!paging()?.loading && paging()?.hasNewer && nearBottom()}>
+                <box flexShrink={0} paddingLeft={1}>
+                  <text fg={theme.textMuted}>(scroll down for more)</text>
+                </box>
+              </Show>
               <box flexShrink={0}>
                 <Show when={permissions().length > 0}>
                   <PermissionPrompt request={permissions()[0]} />
@@ -1223,6 +1480,9 @@ export function Session() {
                 </Show>
                 <Show when={session()?.parentID}>
                   <SubagentFooter />
+                </Show>
+                <Show when={!session()?.parentID && showHeader()}>
+                  <Footer />
                 </Show>
                 <Show when={visible()}>
                   <TuiPluginRuntime.Slot
@@ -1238,9 +1498,8 @@ export function Session() {
                       visible={visible()}
                       ref={bind}
                       disabled={disabled()}
-                      onSubmit={() => {
-                        toBottom()
-                      }}
+                      beforeSubmit={beforeSubmit}
+                      onSubmit={toBottom}
                       sessionID={route.sessionID}
                       right={<TuiPluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
@@ -1307,6 +1566,7 @@ function UserMessage(props: {
     return texts.join("\n\n")
   })
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
+  const sync = useSync()
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
   const queued = createMemo(() => props.pending && props.message.id > props.pending)

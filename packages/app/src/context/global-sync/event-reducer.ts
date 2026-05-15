@@ -15,8 +15,14 @@ import type { State, VcsCache } from "./types"
 import { trimSessions } from "./session-trim"
 import { dropSessionCaches } from "./session-cache"
 import { diffs as list, message as clean } from "@/utils/diffs"
+import { compareMessages } from "@/context/revert-page"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
+const messageIndex = (messages: readonly Message[], id: string) => messages.findIndex((message) => message.id === id)
+const messageInsertIndex = (messages: readonly Message[], message: Message) => {
+  const index = messages.findIndex((item) => compareMessages(message, item) < 0)
+  return index === -1 ? messages.length : index
+}
 
 export function applyGlobalEvent(input: {
   event: { type: string; properties?: unknown }
@@ -189,16 +195,16 @@ export function applyDirectoryEvent(input: {
         input.setStore("message", info.sessionID, [info])
         break
       }
-      const result = Binary.search(messages, info.id, (m) => m.id)
-      if (result.found) {
-        input.setStore("message", info.sessionID, result.index, reconcile(info))
+      const index = messageIndex(messages, info.id)
+      if (index !== -1) {
+        input.setStore("message", info.sessionID, index, reconcile(info))
         break
       }
       input.setStore(
         "message",
         info.sessionID,
         produce((draft) => {
-          draft.splice(result.index, 0, info)
+          draft.splice(messageInsertIndex(draft, info), 0, info)
         }),
       )
       break
@@ -209,8 +215,8 @@ export function applyDirectoryEvent(input: {
         produce((draft) => {
           const messages = draft.message[props.sessionID]
           if (messages) {
-            const result = Binary.search(messages, props.messageID, (m) => m.id)
-            if (result.found) messages.splice(result.index, 1)
+            const index = messageIndex(messages, props.messageID)
+            if (index !== -1) messages.splice(index, 1)
           }
           const parts = draft.part[props.messageID]
           if (parts) {

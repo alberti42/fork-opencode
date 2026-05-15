@@ -764,7 +764,7 @@ export const layer: Layer.Layer<
     })
 
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
-      if (input.limit) {
+      if (input.limit !== undefined) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit })).items
       }
 
@@ -778,8 +778,8 @@ export const layer: Layer.Layer<
           const item = page.items[i]
           if (item) result.push(item)
         }
-        if (!page.more || !page.cursor) break
-        before = page.cursor
+        if (!page.before) break
+        before = page.before
       }
       return result.reverse()
     })
@@ -829,8 +829,8 @@ export const layer: Layer.Layer<
           const item = page.items[i]
           if (item && predicate(item)) return Option.some(item)
         }
-        if (!page.more || !page.cursor) break
-        before = page.cursor
+        if (!page.before) break
+        before = page.before
       }
       return Option.none<MessageV2.WithParts>()
     })

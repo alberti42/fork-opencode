@@ -10,10 +10,11 @@ import {
   createMemo,
   createEffect,
   createComputed,
+  createSignal,
+  createResource,
   on,
   onMount,
   untrack,
-  createResource,
 } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMediaQuery } from "@solid-primitives/media"
@@ -40,6 +41,7 @@ import { usePrompt } from "@/context/prompt"
 import { useSDK } from "@/context/sdk"
 import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
+import { messageBefore } from "@/context/revert-page"
 import { useTerminal } from "@/context/terminal"
 import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
 import { createSessionComposerState, SessionComposerRegion } from "@/pages/session/composer"
@@ -68,6 +70,11 @@ import { formatServerError } from "@/utils/server-errors"
 const emptyUserMessages: UserMessage[] = []
 type FollowupItem = FollowupDraft & { id: string }
 type FollowupEdit = Pick<FollowupItem, "id" | "prompt" | "context">
+type RevertPreview = {
+  userCount: number
+  nextMessageID?: string
+  items: { id: string; text: string }[]
+}
 const emptyFollowups: FollowupItem[] = []
 
 type ChangeMode = "git" | "branch" | "turn"
@@ -471,7 +478,9 @@ export default function Page() {
     () => {
       const revert = revertMessageID()
       if (!revert) return userMessages()
-      return userMessages().filter((m) => m.id < revert)
+      const boundary = messages().find((m) => m.id === revert)
+      if (!boundary) return userMessages().filter((m) => m.id < revert)
+      return userMessages().filter((m) => messageBefore(m, boundary))
     },
     emptyUserMessages,
     {
@@ -506,6 +515,19 @@ export default function Page() {
         if (!prev) return
         if (next.dir === prev.dir && next.id === prev.id) return
         if (prev.id && !next.id) local.session.reset()
+      },
+      { defer: true },
+    ),
+  )
+
+  createEffect(
+    on(
+      () => [params.id, revertMessageID()] as const,
+      ([id, revert], prev) => {
+        if (!id) return
+        if (prev && prev[0] === id && prev[1] === revert) return
+        if (!prev) return
+        void sync.session.sync(id, { force: true })
       },
       { defer: true },
     ),
@@ -788,6 +810,30 @@ export default function Page() {
     },
   )
 
+  const [revertPreview, setRevertPreview] = createSignal<RevertPreview>()
+  let revertPreviewEpoch = 0
+  createEffect(
+    on(
+      () => [params.id, revertMessageID()] as const,
+      ([sessionID, revert]) => {
+        const epoch = ++revertPreviewEpoch
+        setRevertPreview(undefined)
+        if (!sessionID || !revert) return
+        void sdk.client.session
+          .revertPreview({ sessionID })
+          .then((result) => {
+            if (epoch !== revertPreviewEpoch) return
+            setRevertPreview(result.data ?? undefined)
+          })
+          .catch(() => {
+            if (epoch !== revertPreviewEpoch) return
+            setRevertPreview(undefined)
+          })
+      },
+      { defer: true },
+    ),
+  )
+
   createEffect(
     on(
       () => {
@@ -1037,6 +1083,7 @@ export default function Page() {
     setActiveMessage,
     focusInput,
     review: reviewTab,
+    nextRevertMessageID: () => revertPreview()?.nextMessageID,
   })
 
   const openReviewFile = createOpenReviewFile({
@@ -1460,6 +1507,21 @@ export default function Page() {
       attachmentName: language.t("common.attachment"),
     })
 
+  const loadPromptDraft = async (sessionID: string, id: string) => {
+    const parts = sync.data.part[id]
+    if (parts) {
+      return extractPromptFromParts(parts, {
+        directory: sdk.directory,
+        attachmentName: language.t("common.attachment"),
+      })
+    }
+    const result = await sdk.client.session.message({ sessionID, messageID: id })
+    return extractPromptFromParts(result.data?.parts ?? [], {
+      directory: sdk.directory,
+      attachmentName: language.t("common.attachment"),
+    })
+  }
+
   const line = (id: string) => {
     const text = draft(id)
       .map((part) => (part.type === "image" ? `[image:${part.filename}]` : part.content))
@@ -1484,15 +1546,6 @@ export default function Page() {
       if (idx < 0) return list
       const out = list.slice()
       out[idx] = next
-      return out
-    })
-
-  const roll = (sessionID: string, next: NonNullable<ReturnType<typeof info>>["revert"]) =>
-    sync.set("session", (list) => {
-      const idx = list.findIndex((item) => item.id === sessionID)
-      if (idx < 0) return list
-      const out = list.slice()
-      out[idx] = { ...out[idx], revert: next }
       return out
     })
 
@@ -1618,22 +1671,15 @@ export default function Page() {
   const revertMutation = useMutation(() => ({
     mutationFn: async (input: { sessionID: string; messageID: string }) => {
       const prev = prompt.current().slice()
-      const last = info()?.revert
       const value = draft(input.messageID)
-      batch(() => {
-        roll(input.sessionID, { messageID: input.messageID })
-        prompt.set(value)
-      })
+      prompt.set(value)
       await halt(input.sessionID)
         .then(() => sdk.client.session.revert(input))
         .then((result) => {
           if (result.data) merge(result.data)
         })
         .catch((err) => {
-          batch(() => {
-            roll(input.sessionID, last)
-            prompt.set(prev)
-          })
+          prompt.set(prev)
           fail(err)
         })
     },
@@ -1644,25 +1690,31 @@ export default function Page() {
       const sessionID = params.id
       if (!sessionID) return
 
-      const next = userMessages().find((item) => item.id > id)
-      const prev = prompt.current().slice()
-      const last = info()?.revert
+      const preview =
+        revertPreview() ??
+        (await sdk.client.session.revertPreview({ sessionID }).then((result) => result.data ?? undefined))
+      if (info()?.revert?.messageID && !preview) throw new Error("Failed to load revert preview")
 
-      batch(() => {
-        roll(sessionID, next ? { messageID: next.id } : undefined)
-        if (next) {
-          prompt.set(draft(next.id))
-          return
-        }
-        prompt.reset()
-      })
+      const next = (() => {
+        const items = preview?.items
+        if (!items) return undefined
+        const index = items.findIndex((item) => item.id === id)
+        if (index === -1) throw new Error("Restore target missing from revert preview")
+        return items[index + 1]?.id
+      })()
+      const prev = prompt.current().slice()
+      const nextDraft = next ? await loadPromptDraft(sessionID, next).catch(() => undefined) : undefined
+      if (next && !nextDraft) throw new Error("Failed to load next restore draft")
+
+      if (next) prompt.set(nextDraft ?? [])
+      else prompt.reset()
 
       const task = !next
         ? halt(sessionID).then(() => sdk.client.session.unrevert({ sessionID }))
         : halt(sessionID).then(() =>
             sdk.client.session.revert({
               sessionID,
-              messageID: next.id,
+              messageID: next,
             }),
           )
 
@@ -1671,10 +1723,7 @@ export default function Page() {
           if (result.data) merge(result.data)
         })
         .catch((err) => {
-          batch(() => {
-            roll(sessionID, last)
-            prompt.set(prev)
-          })
+          prompt.set(prev)
           fail(err)
         })
     },
@@ -1694,10 +1743,13 @@ export default function Page() {
   }
 
   const rolled = createMemo(() => {
+    const items = revertPreview()?.items
+    if (items) return items
     const id = revertMessageID()
     if (!id) return []
+    const boundary = messages().find((item) => item.id === id)
     return userMessages()
-      .filter((item) => item.id >= id)
+      .filter((item) => (boundary ? !messageBefore(item, boundary) : item.id >= id))
       .map((item) => ({ id: item.id, text: line(item.id) }))
   })
 
